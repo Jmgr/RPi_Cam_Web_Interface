@@ -184,43 +184,44 @@
 	//if $del = false just calculate space which would be freed
 	function deleteFile($d, $del = true) {
 		$size = 0;
-		if(!is_writeable(LBASE_DIR . '/' . MEDIA_PATH . "/$d")) return 0;
+		$debugString = "";
 		$t = getFileType($d); 
 		if ($t == 't') {
 			// For time lapse try to delete all from this batch
 			$files = findLapseFiles($d);
 			foreach($files as $file) {
 				$size += filesize_n($file);
-				if ($del) if(!unlink($file)) $debugString .= "F ";
+				if ($del && !@unlink($file)) $debugString .= "Failed to delete $file\n";
 			}
 		} else {
 			$tFile = dataFilename($d);
 			if (file_exists(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile")) {
 				$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile");
-				if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile");
+				if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile")) $debugString .= "Failed to delete $tFile\n";
 			}
 			if ($t == 'v') {
 				$rFile = substr($tFile,0, strrpos($tFile, '.'));
 				if (file_exists(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile.dat")) {
 					$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile.dat");
-					if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile.dat");
+					if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$tFile.dat")) $debugString .= "Failed to delete $tFile.dat\n";
 				}
 				if (file_exists(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264")) {
 					$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264");
-					if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264");
+					if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264")) $debugString .= "Failed to delete $rFile.h264\n";
 				}
 				if (file_exists(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.bad")) {
 					$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.bad");
-					if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.bad");
+					if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.bad")) $debugString .= "Failed to delete $rFile.h264.bad\n";
 				}
 				if (file_exists(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.log")) {
 					$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.log");
-					if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.log");
+					if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$rFile.h264.log")) $debugString .= "Failed to delete $rFile.h264.log\n";
 				}
 			}
 		}
 		$size += filesize_n(LBASE_DIR . '/' . MEDIA_PATH . "/$d");
-		if ($del) unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$d");
+		if ($del && !@unlink(LBASE_DIR . '/' . MEDIA_PATH . "/$d")) $debugString .= "Failed to delete $d\n";
+		if ($debugString != "") writeDebugLog($debugString);
 		return $size / 1024;
 	}
 

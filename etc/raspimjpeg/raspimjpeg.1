@@ -19,6 +19,10 @@ anno3_custom_text_U 128
 anno3_custom_text_V 128
 anno_text_size 50
 
+# Optional libcamera/Picamera2 tuning file. Useful for NoIR modules, e.g.
+# /usr/share/libcamera/ipa/rpi/vc4/ov5647_noir.json
+tuning_file
+
 sharpness 0
 contrast 0
 brightness 50
@@ -113,6 +117,8 @@ motion_startframes 3
 motion_stopframes 150
 motion_pipe /var/www/FIFO1
 motion_file 0
+# Seconds between low-power motion samples. Raise this on battery power.
+motion_sample_interval 0.5
 
 #
 # File Locations
@@ -181,4 +187,3 @@ enforce_lf 0
 
 #FIFO poll interval microseconds 1000000 minimum
 fifo_interval 100000
-

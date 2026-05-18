@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+#
+# Compatibility daemon for RPi Cam Web Interface.
+#
+# The original project used raspimjpeg/MMAL. This replacement keeps the same
+# FIFO/status/media contract but uses the modern libcamera stack via Picamera2.
+
+import os
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from urllib.parse import unquote_plus
+
+
+STATUS_READY = "ready"
+STATUS_HALTED = "halted"
+
+
+class Config:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.values = {}
+        self.default_values = {}
+        self.user_path = None
+        self.load()
+
+    def load_file(self, path):
+        values = {}
+        if not path.exists():
+            return values
+        for raw_line in path.read_text(errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if " " in line:
+                key, value = line.split(" ", 1)
+                values[key] = value
+            else:
+                values[line] = ""
+        return values
+
+    def load(self):
+        self.default_values = self.load_file(self.path)
+        self.values = dict(self.default_values)
+        user_config = self.values.get("user_config")
+        if user_config:
+            self.user_path = Path(user_config)
+            if not self.user_path.is_absolute():
+                self.user_path = self.path.parent / self.user_path
+            self.values.update(self.load_file(self.user_path))
+
+    def save_user(self):
+        if not self.user_path:
+            return
+        self.user_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.user_path.open("w") as fh:
+            fh.write("#User config file\n")
+            for key in sorted(self.values):
+                default = self.default_values.get(key)
+                value = self.values[key]
+                if default != value:
+                    fh.write(f"{key} {value}\n")
+
+    def reset_user(self):
+        if self.user_path and self.user_path.exists():
+            self.user_path.unlink()
+        self.load()
+
+    def get(self, key, default=""):
+        return self.values.get(key, default)
+
+    def get_int(self, key, default=0, minimum=None, maximum=None):
+        try:
+            value = int(float(self.values.get(key, default)))
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def get_float(self, key, default=0.0, minimum=None, maximum=None):
+        try:
+            value = float(self.values.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def set(self, key, value, persist=True):
+        self.values[key] = str(value)
+        if persist:
+            self.save_user()
+
+
+class RPiCamDaemon:
+    def __init__(self, config_path):
+        self.config = Config(config_path)
+        self.picam2 = None
+        self.running = True
+        self.halted = False
+        self.recording = False
+        self.motion_recording = False
+        self.motion_quiet_since = None
+        self.image_active = False
+        self.timelapse = False
+        self.motion = self.config.get("motion_detection", "false") in ("1", "true", "True")
+        self.video_stop_at = None
+        self.lapse_batch = 0
+        self.lapse_index = 0
+        self.next_lapse_at = 0
+        self.image_index = 0
+        self.video_index = 0
+        self.lock = threading.RLock()
+        self.preview_thread = None
+        self.video_encoder = None
+        self.video_output = None
+        self.current_video_path = None
+        self.motion_reference = None
+        self.motion_warmup_frames = 0
+        self.motion_active_frames = 0
+        self.motion_quiet_frames = 0
+        self.motion_last_check = 0
+        self.motion_last_score = 0
+        self.motion_last_score_log = 0
+        self.motion_mask = None
+        self.motion_mask_key = None
+        self.motion_previous = None
+        self.motion_stream_size = (160, 120)
+
+        self.status_file = Path(self.config.get("status_file", "/dev/shm/mjpeg/status_mjpeg.txt"))
+        self.preview_path = Path(self.config.get("preview_path", "/dev/shm/mjpeg/cam.jpg"))
+        self.control_file = Path(self.config.get("control_file", "/var/www/FIFO"))
+        self.media_path = Path(self.config.get("media_path", "/var/www/media"))
+        self.base_path = Path(self.config.get("base_path", "/var/www"))
+        self.log_file = Path(self.config.get("log_file", str(self.base_path / "scheduleLog.txt")))
+        self.scan_indexes()
+
+    def log(self, message):
+        line = f"raspimjpeg-picamera2: {message}"
+        try:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_file.open("a") as fh:
+                fh.write(time.strftime("[%Y/%m/%d %H:%M:%S] "))
+                fh.write(f"{line}\n")
+        except OSError:
+            pass
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except OSError:
+            pass
+
+    def import_picamera2(self):
+        try:
+            from libcamera import Transform
+            from picamera2 import Picamera2
+            from picamera2.encoders import H264Encoder
+            from picamera2.outputs import FfmpegOutput
+        except Exception as exc:
+            self.write_status(f"Error: Picamera2/libcamera import failed: {exc}")
+            raise
+        return Picamera2, Transform, H264Encoder, FfmpegOutput
+
+    def ensure_paths(self):
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        self.preview_path.parent.mkdir(parents=True, exist_ok=True)
+        self.media_path.mkdir(parents=True, exist_ok=True)
+        if not self.control_file.exists():
+            try:
+                os.mkfifo(self.control_file)
+            except FileExistsError:
+                pass
+
+    def scan_indexes(self):
+        self.media_path.mkdir(parents=True, exist_ok=True)
+        for thumb in self.media_path.glob("*.th.jpg"):
+            suffix = thumb.name.rsplit(".", 3)
+            if len(suffix) < 4:
+                continue
+            type_and_index = suffix[-3]
+            if "_" not in type_and_index:
+                continue
+            file_type, index = type_and_index.split("_", 1)
+            try:
+                number = int(index)
+            except ValueError:
+                continue
+            if file_type == "i":
+                self.image_index = max(self.image_index, number)
+            elif file_type == "v":
+                self.video_index = max(self.video_index, number)
+            elif file_type == "t":
+                self.lapse_batch = max(self.lapse_batch, number)
+
+    def write_status(self, status=None):
+        if status is None:
+            status = self.current_status()
+        try:
+            self.status_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.status_file.with_suffix(".tmp")
+            tmp.write_text(status)
+            tmp.replace(self.status_file)
+        except OSError as exc:
+            self.log(f"status write failed: {exc}")
+
+    def current_status(self):
+        if self.halted:
+            return STATUS_HALTED
+        if self.image_active:
+            return "image"
+        parts = []
+        if self.timelapse:
+            parts.append("tl")
+        if self.motion:
+            parts.append("md")
+        if self.recording:
+            parts.append("video")
+        if not parts:
+            return STATUS_READY
+        if parts == ["md"]:
+            return "md_ready"
+        if parts == ["tl"]:
+            return "timelapse"
+        if parts == ["tl", "md"]:
+            return "tl_md_ready"
+        return "_".join(parts)
+
+    def count_format(self):
+        fmt = self.config.get("count_format", "%04d")
+        try:
+            return fmt
+        except TypeError:
+            return "%04d"
+
+    def format_count(self, value):
+        try:
+            return self.count_format() % value
+        except (TypeError, ValueError):
+            return f"{value:04d}"
+
+    def render_path(self, template, image_index=None, video_index=None, lapse_batch=None, lapse_index=None):
+        now = time.localtime()
+        result = template
+        replacements = {
+            "%Y": time.strftime("%Y", now),
+            "%M": time.strftime("%m", now),
+            "%D": time.strftime("%d", now),
+            "%h": time.strftime("%H", now),
+            "%m": time.strftime("%M", now),
+            "%s": time.strftime("%S", now),
+            "%i": self.format_count(image_index if image_index is not None else self.image_index),
+            "%v": self.format_count(video_index if video_index is not None else self.video_index),
+            "%t": self.format_count(lapse_index if lapse_index is not None else self.lapse_index),
+        }
+        for key, value in replacements.items():
+            result = result.replace(key, value)
+        path = Path(result)
+        if not path.is_absolute():
+            path = self.media_path / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def thumb_path(self, media_file, file_type, index):
+        try:
+            rel = media_file.relative_to(self.media_path)
+        except ValueError:
+            rel = Path(media_file.name)
+        flattened = str(rel).replace("/", self.config.get("subdir_char", "@"))
+        return self.media_path / f"{flattened}.{file_type}_{self.format_count(index)}.th.jpg"
+
+    def make_thumbnail(self, source, thumb):
+        try:
+            from PIL import Image
+            with Image.open(source) as image:
+                image.thumbnail((320, 320))
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                image.save(thumb, "JPEG", quality=80)
+        except Exception:
+            try:
+                if Path(source).exists():
+                    thumb.write_bytes(Path(source).read_bytes())
+            except OSError:
+                pass
+
+    def transform(self):
+        _, Transform, _, _ = self.import_picamera2()
+        rotation = self.config.get_int("rotation", 0)
+        hflip = self.config.get("hflip", "false") in ("1", "true", "True")
+        vflip = self.config.get("vflip", "false") in ("1", "true", "True")
+        if rotation == 180:
+            hflip = not hflip
+            vflip = not vflip
+        return Transform(hflip=hflip, vflip=vflip)
+
+    def tuning_file(self):
+        tuning_file = self.config.get("tuning_file", "").strip()
+        if not tuning_file:
+            return None
+        path = Path(tuning_file)
+        if not path.exists():
+            self.log(f"tuning file not found: {path}")
+            return None
+        self.log(f"using tuning file {path}")
+        return str(path)
+
+    def start_camera(self):
+        with self.lock:
+            if self.picam2 is not None:
+                return
+            Picamera2, _, _, _ = self.import_picamera2()
+            camera_num = max(0, self.config.get_int("camera_num", 0) - 1)
+            tuning_file = self.tuning_file()
+            if tuning_file is not None:
+                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning_file
+                self.picam2 = Picamera2(camera_num=camera_num, tuning=tuning_file)
+            else:
+                os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)
+                self.picam2 = Picamera2(camera_num=camera_num)
+            preview_width = self.config.get_int("width", 512, 128, 1920)
+            preview_height = max(96, int(preview_width * 3 / 4))
+            config = self.picam2.create_preview_configuration(
+                main={"size": (preview_width, preview_height), "format": "XRGB8888"},
+                lores={"size": self.motion_stream_size, "format": "YUV420"},
+                transform=self.transform(),
+                buffer_count=2,
+            )
+            self.picam2.configure(config)
+            self.apply_controls()
+            self.picam2.start()
+            self.halted = False
+            self.write_status()
+            self.log("camera started")
+
+    def stop_camera(self):
+        with self.lock:
+            self.stop_video_locked()
+            if self.picam2 is not None:
+                try:
+                    self.picam2.stop()
+                    self.picam2.close()
+                except Exception as exc:
+                    self.log(f"camera stop failed: {exc}")
+                self.picam2 = None
+            self.halted = True
+            self.write_status()
+            self.log("camera halted")
+
+    def reset_motion_state(self):
+        self.motion_reference = None
+        self.motion_warmup_frames = self.config.get_int("motion_initframes", 0, 0)
+        self.motion_active_frames = 0
+        self.motion_quiet_frames = 0
+        self.motion_last_check = 0
+        self.motion_last_score = 0
+        self.motion_last_score_log = 0
+        self.motion_mask = None
+        self.motion_mask_key = None
+        self.motion_previous = None
+
+    def restart_camera(self):
+        if self.halted or self.recording:
+            return
+        with self.lock:
+            if self.picam2 is None:
+                return
+            try:
+                self.picam2.stop()
+                self.picam2.close()
+            except Exception:
+                pass
+            self.picam2 = None
+            self.start_camera()
+
+    def apply_controls(self):
+        if self.picam2 is None:
+            return
+        try:
+            from libcamera import controls as libcamera_controls
+        except Exception:
+            libcamera_controls = None
+        controls = {}
+        brightness = self.config.get_int("brightness", 50, 0, 100)
+        contrast = self.config.get_int("contrast", 0, -100, 100)
+        saturation = self.config.get_int("saturation", 0, -100, 100)
+        sharpness = self.config.get_int("sharpness", 0, -100, 100)
+        exposure_comp = self.config.get_int("exposure_compensation", 0, -10, 10)
+        white_balance = self.config.get("white_balance", "auto")
+        controls["Brightness"] = (brightness - 50) / 50.0
+        controls["Contrast"] = max(0.0, 1.0 + contrast / 100.0)
+        controls["Saturation"] = max(0.0, 1.0 + saturation / 100.0)
+        controls["Sharpness"] = max(0.0, 1.0 + sharpness / 100.0)
+        controls["ExposureValue"] = float(exposure_comp)
+        controls["AwbEnable"] = white_balance != "off"
+        if white_balance == "off":
+            red_gain = self.config.get_int("autowbgain_r", 150, 1) / 100.0
+            blue_gain = self.config.get_int("autowbgain_b", 150, 1) / 100.0
+            controls["ColourGains"] = (red_gain, blue_gain)
+        elif libcamera_controls is not None:
+            awb_modes = {
+                "auto": "Auto",
+                "sun": "Daylight",
+                "cloudy": "Cloudy",
+                "shade": "Cloudy",
+                "tungsten": "Tungsten",
+                "fluorescent": "Fluorescent",
+                "incandescent": "Incandescent",
+                "flash": "Daylight",
+                "horizon": "Daylight",
+                "greyworld": "Auto",
+            }
+            mode_name = awb_modes.get(white_balance)
+            if mode_name and hasattr(libcamera_controls.AwbModeEnum, mode_name):
+                controls["AwbMode"] = getattr(libcamera_controls.AwbModeEnum, mode_name)
+        shutter = self.config.get_int("shutter_speed", 0, 0)
+        if shutter > 0:
+            controls["ExposureTime"] = shutter
+        try:
+            self.picam2.set_controls(controls)
+        except Exception as exc:
+            self.log(f"set_controls failed: {exc}")
+            for key, value in controls.items():
+                try:
+                    self.picam2.set_controls({key: value})
+                except Exception as control_exc:
+                    self.log(f"set_control {key} failed: {control_exc}")
+
+    def motion_noise_level(self):
+        noise = self.config.get_int("motion_noise", 1010, 1)
+        if noise > 1000:
+            noise -= 1000
+        return max(1, min(255, noise))
+
+    def motion_clip_percent(self):
+        clip = self.config.get_int("motion_clip", 0, 0, 50)
+        return clip if clip >= 2 else 0
+
+    def motion_clip_seconds(self):
+        stop_frames = self.config.get_int("motion_stopframes", 150, 1)
+        fps = self.config.get_int("video_fps", 25, 1)
+        return max(1.0, stop_frames / fps)
+
+    def frame_to_gray(self, frame):
+        try:
+            import numpy as np
+        except Exception as exc:
+            self.log(f"motion detection unavailable: numpy import failed: {exc}")
+            return None
+        if frame is None:
+            return None
+        arr = np.asarray(frame)
+        if arr.ndim == 2:
+            gray = arr
+            if gray.shape[0] > self.motion_stream_size[1]:
+                gray = gray[:self.motion_stream_size[1], :]
+        else:
+            rgb = arr[:, :, :3].astype(np.uint16)
+            gray = ((rgb[:, :, 0] * 77 + rgb[:, :, 1] * 150 + rgb[:, :, 2] * 29) >> 8).astype(np.uint8)
+        clip = self.motion_clip_percent()
+        if clip:
+            h, w = gray.shape[:2]
+            y = max(1, int(h * clip / 100))
+            x = max(1, int(w * clip / 100))
+            if h > y * 2 and w > x * 2:
+                gray = gray[y:h - y, x:w - x]
+        return gray[::2, ::2]
+
+    def motion_image_path(self):
+        value = self.config.get("motion_image", "").strip()
+        if not value or self.config.get("motion_mask_disable", "0") in ("1", "true", "True"):
+            return None
+        path = Path(value)
+        candidates = [path] if path.is_absolute() else [
+            self.base_path / value,
+            self.media_path / value,
+            self.config.path.parent / value,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        self.log(f"motion mask image not found: {value}")
+        return None
+
+    def motion_mask_for(self, shape):
+        path = self.motion_image_path()
+        key = (str(path) if path else "", shape)
+        if self.motion_mask_key == key:
+            return self.motion_mask
+        self.motion_mask_key = key
+        self.motion_mask = None
+        if path is None:
+            return None
+        try:
+            import numpy as np
+            from PIL import Image
+            rows, cols = shape
+            with Image.open(path) as image:
+                image = image.convert("L").resize((cols, rows))
+                mask = np.asarray(image) > 127
+            if mask.any():
+                self.motion_mask = mask
+                self.log(f"loaded motion mask {path}")
+            else:
+                self.log(f"motion mask {path} has no active pixels")
+        except Exception as exc:
+            self.log(f"motion mask load failed for {path}: {exc}")
+        return self.motion_mask
+
+    def motion_file_enabled(self):
+        return self.config.get("motion_file", "0") in ("1", "true", "True")
+
+    def write_motion_sample(self, score, threshold, active_frames):
+        if not self.motion_file_enabled():
+            return
+        try:
+            path = self.media_path / "motion.dat"
+            with path.open("a") as fh:
+                fh.write(f"{time.time():.3f},{score},{threshold},{active_frames}\n")
+        except OSError as exc:
+            self.log(f"motion .dat write failed: {exc}")
+
+    def write_vector_preview(self, changed, score, threshold):
+        if self.config.get("vector_preview", "false") not in ("1", "true", "True"):
+            return
+        try:
+            import numpy as np
+            from PIL import Image, ImageDraw
+            image = Image.fromarray(np.where(changed, 255, 0).astype(np.uint8), mode="L")
+            image = image.resize((max(160, image.width * 2), max(120, image.height * 2)))
+            image = image.convert("RGB")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, 0, image.width - 1, 16), fill=(0, 0, 0))
+            draw.text((4, 2), f"motion {score}/{threshold}", fill=(255, 255, 255))
+            image.save(self.preview_path, "JPEG", quality=80)
+        except Exception as exc:
+            self.log(f"vector preview write failed: {exc}")
+
+    def check_motion_locked(self):
+        if not self.motion or self.image_active or self.picam2 is None:
+            return
+        now = time.time()
+        interval = self.config.get_float("motion_sample_interval", 0.5, 0.1, 10.0)
+        if now - self.motion_last_check < interval:
+            return
+        self.motion_last_check = now
+        frame = None
+        stream_names = ("lores", "main") if self.recording else ("main", "lores")
+        errors = []
+        for stream_name in stream_names:
+            try:
+                frame = self.picam2.capture_array(stream_name)
+                break
+            except Exception as exc:
+                errors.append(f"{stream_name}: {exc}")
+        if frame is None:
+            self.log(f"motion frame capture failed: {'; '.join(errors)}")
+            return
+        gray = self.frame_to_gray(frame)
+        if gray is None:
+            return
+        try:
+            import numpy as np
+        except Exception:
+            return
+        current = gray.astype(np.int16)
+        if self.motion_reference is None or self.motion_reference.shape != current.shape:
+            self.motion_reference = current.astype(np.float32)
+            self.motion_previous = current.copy()
+            self.motion_warmup_frames = self.config.get_int("motion_initframes", 0, 0)
+            self.motion_active_frames = 0
+            self.motion_quiet_frames = 0
+            self.log("motion detector initialised")
+            return
+        if self.motion_warmup_frames > 0:
+            self.motion_warmup_frames -= 1
+            self.motion_reference = self.motion_reference * 0.8 + current * 0.2
+            self.motion_previous = current.copy()
+            return
+        if self.motion_recording:
+            if self.motion_previous is None or self.motion_previous.shape != current.shape:
+                self.motion_previous = current.copy()
+                return
+            diff = np.abs(current - self.motion_previous)
+            self.motion_previous = current.copy()
+        else:
+            diff = np.abs(current - self.motion_reference.astype(np.int16))
+            self.motion_previous = current.copy()
+        changed = diff > self.motion_noise_level()
+        mask = self.motion_mask_for(changed.shape)
+        if mask is not None:
+            changed = changed & mask
+        score = int(np.count_nonzero(changed))
+        self.motion_last_score = score
+        threshold = self.config.get_int("motion_threshold", 250, 1)
+        start_frames = self.config.get_int("motion_startframes", 3, 1)
+        self.write_motion_sample(score, threshold, self.motion_active_frames)
+        self.write_vector_preview(changed, score, threshold)
+        if self.config.get("vector_preview", "false") in ("1", "true", "True") and now - self.motion_last_score_log >= 5:
+            self.motion_last_score_log = now
+            self.log(f"motion score={score} threshold={threshold} active_frames={self.motion_active_frames}")
+        if score >= threshold:
+            self.motion_active_frames += 1
+            self.motion_quiet_frames = 0
+            if self.motion_recording:
+                if self.motion_quiet_since is not None:
+                    self.log(f"motion resumed score={score}; continuing recording")
+                self.motion_quiet_since = None
+        else:
+            self.motion_active_frames = 0
+            self.motion_quiet_frames += 1
+            self.motion_reference = self.motion_reference * 0.95 + current * 0.05
+            if self.motion_recording and self.motion_quiet_since is None:
+                self.motion_quiet_since = now
+                self.log(f"motion quiet score={score}; waiting {self.motion_clip_seconds():.1f}s before stop")
+        if self.motion_recording and self.motion_quiet_since is not None:
+            quiet_for = now - self.motion_quiet_since
+            if quiet_for >= self.motion_clip_seconds():
+                self.log(f"motion quiet for {quiet_for:.1f}s; stopping recording")
+                self.stop_video()
+                return
+        if self.motion_active_frames >= start_frames and not self.recording:
+            self.log(f"motion detected score={score} threshold={threshold}; recording until quiet")
+            self.motion_active_frames = 0
+            self.motion_previous = None
+            self.start_video(motion_triggered=True)
+
+    def preview_loop(self):
+        while self.running:
+            if self.halted:
+                time.sleep(0.2)
+                continue
+            if self.recording:
+                if self.motion:
+                    with self.lock:
+                        self.check_motion_locked()
+                time.sleep(max(0.1, self.config.get_float("motion_sample_interval", 0.5, 0.1, 10.0) / 2))
+                continue
+            try:
+                with self.lock:
+                    if self.picam2 is not None:
+                        self.picam2.capture_file(str(self.preview_path), format="jpeg")
+                        self.check_motion_locked()
+            except Exception as exc:
+                self.write_status(f"Error: preview capture failed: {exc}")
+                self.log(f"preview capture failed: {exc}")
+                time.sleep(2)
+            delay = max(0.1, self.config.get_int("divider", 1, 1, 16) / max(1, self.config.get_int("video_fps", 10, 1, 30)))
+            if self.motion:
+                delay = max(delay, self.config.get_float("motion_sample_interval", 0.5, 0.1, 10.0) / 2)
+            time.sleep(delay)
+
+    def capture_image(self, lapse=False):
+        if self.halted:
+            return
+        with self.lock:
+            if self.picam2 is None:
+                self.start_camera()
+            self.image_active = not lapse
+            self.write_status()
+            if lapse:
+                self.lapse_index += 1
+                template = self.config.get("lapse_path", str(self.media_path / "tl_%i_%t_%Y%M%D_%h%m%s.jpg"))
+                output = self.render_path(template, image_index=self.lapse_batch, lapse_index=self.lapse_index)
+                thumb_type = "t"
+                thumb_index = self.lapse_batch
+            else:
+                self.image_index += 1
+                template = self.config.get("image_path", str(self.media_path / "im_%i_%Y%M%D_%h%m%s.jpg"))
+                output = self.render_path(template, image_index=self.image_index)
+                thumb_type = "i"
+                thumb_index = self.image_index
+            try:
+                width = self.config.get_int("image_width", 2592, 64)
+                height = self.config.get_int("image_height", 1944, 64)
+                still_config = self.picam2.create_still_configuration(
+                    main={"size": (width, height)},
+                    transform=self.transform(),
+                )
+                self.picam2.switch_mode_and_capture_file(still_config, str(output))
+                self.make_thumbnail(output, self.thumb_path(output, thumb_type, thumb_index))
+                self.log(f"captured image {output}")
+            except Exception as exc:
+                self.write_status(f"Error: image capture failed: {exc}")
+                self.log(f"image capture failed: {exc}")
+            finally:
+                self.image_active = False
+                self.write_status()
+                self.restart_camera()
+
+    def start_video(self, duration=None, motion_triggered=False):
+        if self.halted:
+            return
+        with self.lock:
+            if self.recording:
+                if motion_triggered:
+                    self.motion_recording = True
+                    self.motion_quiet_since = None
+                return
+            if self.picam2 is None:
+                self.start_camera()
+            _, _, H264Encoder, FfmpegOutput = self.import_picamera2()
+            self.video_index += 1
+            template = self.config.get("video_path", str(self.media_path / "vi_%v_%Y%M%D_%h%m%s.mp4"))
+            output = self.render_path(template, video_index=self.video_index)
+            width = self.config.get_int("video_width", 1280, 64)
+            height = self.config.get_int("video_height", 720, 64)
+            fps = self.config.get_int("video_fps", 25, 1, 60)
+            bitrate = self.config.get_int("video_bitrate", 10000000, 100000)
+            try:
+                self.picam2.stop()
+                video_config = self.picam2.create_video_configuration(
+                    main={"size": (width, height)},
+                    lores={"size": self.motion_stream_size, "format": "YUV420"},
+                    controls={"FrameRate": fps},
+                    transform=self.transform(),
+                )
+                self.picam2.configure(video_config)
+                self.apply_controls()
+                encoder = H264Encoder(bitrate=bitrate)
+                ffmpeg_output = FfmpegOutput(str(output), audio=False)
+                self.picam2.start_recording(encoder, ffmpeg_output)
+                self.video_encoder = encoder
+                self.video_output = ffmpeg_output
+                self.current_video_path = output
+                self.recording = True
+                self.motion_recording = motion_triggered
+                self.motion_quiet_since = None
+                self.video_stop_at = None if motion_triggered else (time.time() + duration if duration else None)
+                if self.preview_path.exists():
+                    self.make_thumbnail(self.preview_path, self.thumb_path(output, "v", self.video_index))
+                self.write_status()
+                self.log(f"started {'motion ' if motion_triggered else ''}video {output}")
+            except Exception as exc:
+                self.recording = False
+                self.motion_recording = False
+                self.motion_quiet_since = None
+                self.write_status(f"Error: video start failed: {exc}")
+                self.log(f"video start failed: {exc}")
+                self.restart_camera()
+
+    def stop_video_locked(self):
+        if not self.recording or self.picam2 is None:
+            return
+        try:
+            self.picam2.stop_recording()
+            self.log(f"stopped video {self.current_video_path}")
+        except Exception as exc:
+            self.log(f"video stop failed: {exc}")
+        self.recording = False
+        self.motion_recording = False
+        self.motion_quiet_since = None
+        self.video_stop_at = None
+        self.video_encoder = None
+        self.video_output = None
+        self.current_video_path = None
+        self.write_status()
+        if not self.halted:
+            self.restart_camera()
+
+    def stop_video(self):
+        with self.lock:
+            self.stop_video_locked()
+
+    def run_macro(self, value):
+        if not value:
+            return
+        macros_path = Path(self.config.get("macros_path", str(self.base_path / "macros")))
+        parts = shlex.split(value)
+        if not parts:
+            return
+        script = macros_path / parts[0]
+        if not script.exists():
+            self.log(f"macro not found: {script}")
+            return
+        try:
+            subprocess.Popen([str(script)] + parts[1:], cwd=str(macros_path))
+        except Exception as exc:
+            self.log(f"macro failed: {exc}")
+
+    def set_simple(self, key, value):
+        self.config.set(key, value)
+        if key in {"sharpness", "contrast", "brightness", "saturation", "exposure_compensation", "shutter_speed"}:
+            with self.lock:
+                self.apply_controls()
+        if key.startswith("motion_") or key == "vector_preview":
+            with self.lock:
+                self.reset_motion_state()
+
+    def handle_command(self, command):
+        command = unquote_plus(command.strip())
+        if not command:
+            return
+        self.log(f"command {command}")
+        parts = command.split()
+        code = parts[0]
+        args = parts[1:]
+        try:
+            if code == "im":
+                self.capture_image()
+            elif code == "ca":
+                if args and args[0] == "1":
+                    duration = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+                    self.start_video(duration)
+                else:
+                    self.stop_video()
+            elif code == "tl":
+                enabled = bool(args and args[0] == "1")
+                self.timelapse = enabled
+                if enabled:
+                    self.lapse_batch += 1
+                    self.lapse_index = 0
+                    self.next_lapse_at = 0
+                self.write_status()
+            elif code == "md":
+                self.motion = bool(args and args[0] == "1")
+                self.reset_motion_state()
+                self.log(f"motion detection {'enabled' if self.motion else 'disabled'}")
+                self.write_status()
+            elif code == "ru":
+                if args and args[0] == "0":
+                    self.stop_camera()
+                else:
+                    self.start_camera()
+            elif code == "rs":
+                self.config.reset_user()
+                self.restart_camera()
+            elif code == "px" and len(args) >= 7:
+                for key, value in zip(("video_width", "video_height", "video_fps", "MP4Box_fps", "image_width", "image_height", "fps_divider"), args[:7]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+                self.restart_camera()
+            elif code == "pv" and len(args) >= 3:
+                for key, value in zip(("quality", "width", "divider"), args[:3]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+                self.restart_camera()
+            elif code == "fl" and args:
+                value = int(args[0])
+                self.config.set("hflip", "true" if value & 1 else "false", persist=False)
+                self.config.set("vflip", "true" if value & 2 else "false", persist=False)
+                self.config.save_user()
+                self.restart_camera()
+            elif code == "bo" and args:
+                mapping = {"0": "off", "1": "inline", "2": "background"}
+                self.config.set("MP4Box", mapping.get(args[0], args[0]))
+            elif code == "ri" and len(args) >= 4:
+                for key, value in zip(("sensor_region_x", "sensor_region_y", "sensor_region_w", "sensor_region_h"), args[:4]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+            elif code == "ce" and len(args) >= 3:
+                for key, value in zip(("colour_effect_en", "colour_effect_u", "colour_effect_v"), args[:3]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+            elif code == "at" and len(args) >= 4:
+                for key, value in zip(("anno3_custom_text_colour", "anno3_custom_text_Y", "anno3_custom_text_U", "anno3_custom_text_V"), args[:4]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+            elif code == "ac" and len(args) >= 4:
+                for key, value in zip(("anno3_custom_background_colour", "anno3_custom_background_Y", "anno3_custom_background_U", "anno3_custom_background_V"), args[:4]):
+                    self.config.set(key, value, persist=False)
+                self.config.save_user()
+            elif code == "ag" and len(args) >= 2:
+                self.config.set("autowbgain_r", args[0], persist=False)
+                self.config.set("autowbgain_b", args[1], persist=False)
+                self.config.save_user()
+            elif code == "an":
+                self.config.set("annotation", command[3:] if len(command) > 3 else "")
+            elif code == "sy":
+                self.run_macro(command[3:] if len(command) > 3 else "")
+            elif code == "um" and len(args) >= 2:
+                self.config.set(f"macro{args[0]}", " ".join(args[1:]))
+            else:
+                key_map = {
+                    "ab": "anno_background",
+                    "as": "anno_text_size",
+                    "sh": "sharpness",
+                    "co": "contrast",
+                    "br": "brightness",
+                    "sa": "saturation",
+                    "is": "iso",
+                    "mm": "metering_mode",
+                    "vs": "video_stabilisation",
+                    "ec": "exposure_compensation",
+                    "em": "exposure_mode",
+                    "wb": "white_balance",
+                    "ie": "image_effect",
+                    "ro": "rotation",
+                    "qu": "image_quality",
+                    "bu": "video_buffer",
+                    "bi": "video_bitrate",
+                    "rl": "raw_layer",
+                    "tv": "tl_interval",
+                    "vi": "video_split",
+                    "vp": "vector_preview",
+                    "mn": "motion_noise",
+                    "mt": "motion_threshold",
+                    "mc": "motion_clip",
+                    "mi": "motion_image",
+                    "ms": "motion_initframes",
+                    "mb": "motion_startframes",
+                    "me": "motion_stopframes",
+                    "mf": "motion_file",
+                    "mz": "motion_mask_disable",
+                    "mx": "motion_external",
+                    "cn": "camera_num",
+                    "st": "stat_pass",
+                    "ls": "log_size",
+                    "hp": "hdmi_preview",
+                }
+                if code in key_map and args:
+                    self.set_simple(key_map[code], " ".join(args))
+                    if code in {"ro", "cn"}:
+                        self.restart_camera()
+        except Exception as exc:
+            self.write_status(f"Error: command {code} failed: {exc}")
+            self.log(f"command {command} failed: {exc}")
+
+    def periodic(self):
+        now = time.time()
+        if self.video_stop_at and now >= self.video_stop_at:
+            self.stop_video()
+        if self.timelapse and not self.recording and not self.image_active:
+            interval = self.config.get_int("tl_interval", 30, 1) / 10.0
+            if now >= self.next_lapse_at:
+                self.next_lapse_at = now + interval
+                self.capture_image(lapse=True)
+
+    def command_loop(self):
+        self.ensure_paths()
+        reader = os.open(self.control_file, os.O_RDONLY | os.O_NONBLOCK)
+        writer = os.open(self.control_file, os.O_WRONLY | os.O_NONBLOCK)
+        buffer = b""
+        try:
+            while self.running:
+                ready, _, _ = select.select([reader], [], [], 0.25)
+                if ready:
+                    chunk = os.read(reader, 4096)
+                    if chunk:
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            self.handle_command(line.decode(errors="replace"))
+                self.periodic()
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def stop(self, *_args):
+        self.running = False
+        with self.lock:
+            self.stop_video_locked()
+            if self.picam2 is not None:
+                try:
+                    self.picam2.stop()
+                    self.picam2.close()
+                except Exception:
+                    pass
+                self.picam2 = None
+        self.write_status(STATUS_HALTED)
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        self.ensure_paths()
+        self.log(f"starting with config {self.config.path}")
+        self.log(f"log file {self.log_file}")
+        if self.config.user_path:
+            self.log(f"user config {self.config.user_path}")
+        if self.motion:
+            self.reset_motion_state()
+            self.log("motion detection enabled from config")
+        try:
+            self.start_camera()
+        except Exception as exc:
+            self.log(f"camera start failed: {exc}")
+            return 1
+        self.preview_thread = threading.Thread(target=self.preview_loop, daemon=True)
+        self.preview_thread.start()
+        self.command_loop()
+        self.stop()
+        return 0
+
+
+def find_config(argv):
+    if len(argv) > 1:
+        return argv[1]
+    candidates = [
+        Path("/etc/raspimjpeg"),
+        Path.cwd() / "raspimjpeg",
+        Path.cwd() / "etc" / "raspimjpeg" / "raspimjpeg",
+        Path.cwd() / "etc" / "raspimjpeg" / "raspimjpeg.1",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "/etc/raspimjpeg"
+
+
+if __name__ == "__main__":
+    daemon = RPiCamDaemon(find_config(sys.argv))
+    raise SystemExit(daemon.run())

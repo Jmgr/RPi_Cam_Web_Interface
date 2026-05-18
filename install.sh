@@ -61,6 +61,9 @@ elif [ $VERSION -eq 12 ]; then
 #   sudo grep -qxF 'start_x=1' /boot/config.txt || sudo sed -i '$ a start_x=1' /boot/config.txt
 #   sudo grep -qxF 'gpu_mem=128' /boot/config.txt || sudo sed -i '$ a gpu_mem=128' /boot/config.txt
    sudo mkdir -p /opt/vc/bin
+elif [ $VERSION -eq 13 ]; then
+   phpversion=8.4
+   sudo mkdir -p /opt/vc/bin
 else
    phpversion=7.0
 fi
@@ -115,7 +118,7 @@ if [ $# -eq 0 ] || [ "$1" != "q" ]; then
    "User:(blank=nologin)"  5 1   "$user"        5 32 15 0  \
    "Password:"             6 1   "$webpasswd"   6 32 15 0  \
    "jpglink:(yes/no)"      7 1   "$jpglink"     7 32 15 0  \
-   "php:(stretch 7.0,buster 7.3)"           8 1   "$phpversion"  8 32 15 0  \
+   "php:(bookworm 8.2,trixie 8.4)"           8 1   "$phpversion"  8 32 15 0  \
    2>&1 1>&3 | {
       read -r rpicamdir
       read -r autostart
@@ -160,6 +163,7 @@ fi
 fn_stop ()
 { # This is function stop
         sudo killall raspimjpeg 2>/dev/null
+        sudo pkill -f '(^|/)(raspimjpeg|raspimjpeg-picamera2)( |$)' 2>/dev/null
         sudo killall php 2>/dev/null
         sudo killall motion 2>/dev/null
 }
@@ -374,15 +378,15 @@ else
 fi
 
 if [ "$webserver" == "apache" ]; then
-   sudo apt-get install -y apache2 $phpv $phpv-cli libapache2-mod-$phpv gpac motion zip gstreamer1.0-tools
+   sudo apt-get install -y apache2 $phpv $phpv-cli libapache2-mod-$phpv motion zip gstreamer1.0-tools ffmpeg python3-picamera2 python3-pil python3-numpy
    if [ $? -ne 0 ]; then exit; fi
    fn_apache
 elif [ "$webserver" == "nginx" ]; then
-   sudo apt-get install -y nginx $phpv-fpm $phpv-cli $phpv-common php-apcu apache2-utils gpac motion zip gstreamer1.0-tools
+   sudo apt-get install -y nginx $phpv-fpm $phpv-cli $phpv-common php-apcu apache2-utils motion zip gstreamer1.0-tools ffmpeg python3-picamera2 python3-pil python3-numpy
    if [ $? -ne 0 ]; then exit; fi
    fn_nginx
 elif [ "$webserver" == "lighttpd" ]; then
-   sudo apt-get install -y  lighttpd $phpv-cli $phpv-common $phpv-cgi $phpv gpac motion zip gstreamer1.0-tools
+   sudo apt-get install -y  lighttpd $phpv-cli $phpv-common $phpv-cgi $phpv motion zip gstreamer1.0-tools ffmpeg python3-picamera2 python3-pil python3-numpy
    if [ $? -ne 0 ]; then exit; fi
    fn_lighttpd
 fi
@@ -429,11 +433,9 @@ sudo chown -R www-data:www-data /var/www$rpicamdir
 sudo cp etc/sudoers.d/RPI_Cam_Web_Interface /etc/sudoers.d/
 sudo chmod 440 /etc/sudoers.d/RPI_Cam_Web_Interface
 
-sudo cp -r bin/raspimjpeg /opt/vc/bin/
+sudo cp -r bin/raspimjpeg-picamera2 /opt/vc/bin/raspimjpeg
 sudo chmod 755 /opt/vc/bin/raspimjpeg
-if [ ! -e /usr/bin/raspimjpeg ]; then
-   sudo ln -s /opt/vc/bin/raspimjpeg /usr/bin/raspimjpeg
-fi
+sudo ln -sf /opt/vc/bin/raspimjpeg /usr/bin/raspimjpeg
 
 sed -e "s/www/www$rpicamdirEsc/" etc/raspimjpeg/raspimjpeg.1 > etc/raspimjpeg/raspimjpeg
 if [[ `cat /proc/cmdline |awk -v RS=' ' -F= '/boardrev/ { print $2 }'` == "0x11" ]]; then
@@ -450,6 +452,9 @@ if [ ! -e /var/www$rpicamdir/raspimjpeg ]; then
 fi
 
 sudo usermod -a -G video www-data
+if getent group render >/dev/null; then
+   sudo usermod -a -G render www-data
+fi
 if [ -e /var/www$rpicamdir/uconfig ]; then
    sudo chown www-data:www-data /var/www$rpicamdir/uconfig
 fi

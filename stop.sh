@@ -42,6 +42,7 @@ source ./config.txt
 fn_stop ()
 { # This is function stop
    sudo killall raspimjpeg 2>/dev/null
+   sudo pkill -f '(^|/)(raspimjpeg|raspimjpeg-picamera2)( |$)' 2>/dev/null
    sudo killall php 2>/dev/null
    sudo killall motion 2>/dev/null
 }
